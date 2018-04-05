@@ -4,7 +4,8 @@
   "description": "A Node-RED node to access Cloudant and couchdb databases",
   "dependencies": {
     "cfenv": "1.0.0",
-    "cloudant": "1.4.*"
+    "cloudant": "1.4.*",
+    "mustache": "^2.3.0"
   },
   "repository": {
     "type": "git",

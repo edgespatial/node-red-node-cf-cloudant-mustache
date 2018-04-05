@@ -15,14 +15,15 @@
  **/
 module.exports = function(RED) {
     "use strict";
-    var url         = require('url');
-    var querystring = require('querystring');
-    var cfEnv       = require("cfenv");
-    var Cloudant    = require("cloudant");
+    var url = require("url");
+    var querystring = require("querystring");
+    var cfEnv = require("cfenv");
+    var Cloudant = require("cloudant");
+    var mustache = require("mustache");
 
     var MAX_ATTEMPTS = 3;
 
-    var appEnv   = cfEnv.getAppEnv();
+    var appEnv = cfEnv.getAppEnv();
     var services = [];
 
     // load the services bound to this application
@@ -30,9 +31,11 @@ module.exports = function(RED) {
         if (appEnv.services.hasOwnProperty(i)) {
             // filter the services to include only the Cloudant ones
             if (i.match(/^(cloudant)/i)) {
-                services = services.concat(appEnv.services[i].map(function(v) {
-                    return { name: v.name, label: v.label };
-                }));
+                services = services.concat(
+                    appEnv.services[i].map(function(v) {
+                        return { name: v.name, label: v.label };
+                    })
+                );
             }
         }
     }
@@ -40,7 +43,7 @@ module.exports = function(RED) {
     //
     // HTTP endpoints that will be accessed from the HTML file
     //
-    RED.httpAdmin.get('/cloudant/vcap', function(req,res) {
+    RED.httpAdmin.get("/cloudant/vcap", function(req, res) {
         res.send(JSON.stringify(services));
     });
 
@@ -52,57 +55,66 @@ module.exports = function(RED) {
         this.name = n.name;
         this.host = n.host;
         this.url = n.host;
-
         // remove unnecessary parts from host value
         var parsedUrl = url.parse(this.host);
         if (parsedUrl.host) {
             this.host = parsedUrl.host;
         }
-        if (this.host.indexOf("cloudant.com")!==-1) {
+        if (this.host.indexOf("cloudant.com") !== -1) {
             // extract only the account name
-            this.account = this.host.substring(0, this.host.indexOf('.'));
+            this.account = this.host.substring(0, this.host.indexOf("."));
             delete this.url;
         }
         var credentials = this.credentials;
-        if ((credentials) && (credentials.hasOwnProperty("username"))) { this.username = credentials.username; }
-        if ((credentials) && (credentials.hasOwnProperty("pass"))) { this.password = credentials.pass; }
+        if (credentials && credentials.hasOwnProperty("username")) {
+            this.username = credentials.username;
+        }
+        if (credentials && credentials.hasOwnProperty("pass")) {
+            this.password = credentials.pass;
+        }
     }
     RED.nodes.registerType("cloudant", CloudantNode, {
         credentials: {
-            pass: {type:"password"},
-            username: {type:"text"}
+            pass: { type: "password" },
+            username: { type: "text" }
         }
     });
 
-
     function CloudantOutNode(n) {
-        RED.nodes.createNode(this,n);
+        RED.nodes.createNode(this, n);
 
-        this.operation      = n.operation;
-        this.payonly        = n.payonly || false;
-        this.database       = _cleanDatabaseName(n.database, this);
+        this.operation = n.operation;
+        this.payonly = n.payonly || false;
+        var database = n.database;
+        var isTemplatedDatabase = (database || "").indexOf("{{") != -1;
         this.cloudantConfig = _getCloudantConfig(n);
 
         var node = this;
         var credentials = {
-            account:  node.cloudantConfig.account,
-            key:      node.cloudantConfig.username,
+            account: node.cloudantConfig.account,
+            key: node.cloudantConfig.username,
             password: node.cloudantConfig.password,
             url: node.cloudantConfig.url
         };
 
         Cloudant(credentials, function(err, cloudant) {
-            if (err) { node.error(err.description, err); }
-            else {
+            if (err) {
+                node.error(err.description, err);
+            } else {
                 // check if the database exists and create it if it doesn't
-                createDatabase(cloudant, node);
             }
 
             node.on("input", function(msg) {
-                if (err) { 
-                    return node.error(err.description, err); 
+                if (err) {
+                    return node.error(err.description, err);
                 }
+                if (isTemplatedDatabase) {
+                    // render from msg
+                    database = mustache.render(database, msg);
+                }
+                this.database = _cleanDatabaseName(database, this);
 
+                createDatabase(cloudant, node);
                 delete msg._msgid;
                 handleMessage(cloudant, node, msg);
             });
@@ -116,14 +128,17 @@ module.exports = function(RED) {
                         // an api key, so we can assume the database already exists
                         return;
                     }
-                    node.error("Failed to list databases: " + err.description, err);
-                }
-                else {
+                    node.error(
+                        "Failed to list databases: " + err.description,
+                        err
+                    );
+                } else {
                     if (all_dbs && all_dbs.indexOf(node.database) < 0) {
                         cloudant.db.create(node.database, function(err, body) {
                             if (err) {
                                 node.error(
-                                    "Failed to create database: " + err.description,
+                                    "Failed to create database: " +
+                                        err.description,
                                     err
                                 );
                             }
@@ -135,30 +150,40 @@ module.exports = function(RED) {
 
         function handleMessage(cloudant, node, msg) {
             if (node.operation === "insert") {
-                var msg  = node.payonly ? msg.payload : msg;
+                var msg = node.payonly ? msg.payload : msg;
                 var root = node.payonly ? "payload" : "msg";
-                var doc  = parseMessage(msg, root);
+                var doc = parseMessage(msg, root);
 
-                insertDocument(cloudant, node, doc, MAX_ATTEMPTS, function(err, body) {
+                insertDocument(cloudant, node, doc, MAX_ATTEMPTS, function(
+                    err,
+                    body
+                ) {
                     if (err) {
                         console.trace();
                         console.log(node.error.toString());
-                        node.error("Failed to insert document: " + err.description, msg);
+                        node.error(
+                            "Failed to insert document: " + err.description,
+                            msg
+                        );
                     }
                 });
-            }
-            else if (node.operation === "delete") {
+            } else if (node.operation === "delete") {
                 var doc = parseMessage(msg.payload || msg, "");
 
                 if ("_rev" in doc && "_id" in doc) {
                     var db = cloudant.use(node.database);
                     db.destroy(doc._id, doc._rev, function(err, body) {
                         if (err) {
-                            node.error("Failed to delete document: " + err.description, msg);
+                            node.error(
+                                "Failed to delete document: " + err.description,
+                                msg
+                            );
                         }
                     });
                 } else {
-                    var err = new Error("_id and _rev are required to delete a document");
+                    var err = new Error(
+                        "_id and _rev are required to delete a document"
+                    );
                     node.error(err.message, msg);
                 }
             }
@@ -190,7 +215,9 @@ module.exports = function(RED) {
                     var newKey = key.substring(1, msg.length);
                     msg[newKey] = msg[key];
                     delete msg[key];
-                    node.warn("Property '" + key + "' renamed to '" + newKey + "'.");
+                    node.warn(
+                        "Property '" + key + "' renamed to '" + newKey + "'."
+                    );
                 }
             }
             return msg;
@@ -198,10 +225,17 @@ module.exports = function(RED) {
 
         function isFieldNameValid(key) {
             var allowedWords = [
-                '_id', '_rev', '_attachments', '_deleted', '_revisions',
-                '_revs_info', '_conflicts', '_deleted_conflicts', '_local_seq'
+                "_id",
+                "_rev",
+                "_attachments",
+                "_deleted",
+                "_revisions",
+                "_revs_info",
+                "_conflicts",
+                "_deleted_conflicts",
+                "_local_seq"
             ];
-            return key[0] !== '_' || allowedWords.indexOf(key) >= 0;
+            return key[0] !== "_" || allowedWords.indexOf(key) >= 0;
         }
 
         // Inserts a document +doc+ in a database +db+ that migh not exist
@@ -214,45 +248,56 @@ module.exports = function(RED) {
                 if (err && err.status_code === 404 && attempts > 0) {
                     // status_code 404 means the database was not found
                     return cloudant.db.create(db.config.db, function() {
-                        insertDocument(cloudant, node, doc, attempts-1, callback);
+                        insertDocument(
+                            cloudant,
+                            node,
+                            doc,
+                            attempts - 1,
+                            callback
+                        );
                     });
                 }
 
                 callback(err, body);
             });
         }
-    };
+    }
     RED.nodes.registerType("cloudant out", CloudantOutNode);
 
-
     function CloudantInNode(n) {
-        RED.nodes.createNode(this,n);
+        RED.nodes.createNode(this, n);
 
         this.cloudantConfig = _getCloudantConfig(n);
-        this.database       = _cleanDatabaseName(n.database, this);
-        this.search         = n.search;
-        this.design         = n.design;
-        this.index          = n.index;
-        this.inputId        = "";
-
+        var database = n.database;
+        var isTemplatedDatabase = (database || "").indexOf("{{") != -1;
+        this.search = n.search;
+        this.design = n.design;
+        this.index = n.index;
+        this.inputId = "";
         var node = this;
         var credentials = {
-            account:  node.cloudantConfig.account,
-            key:      node.cloudantConfig.username,
+            account: node.cloudantConfig.account,
+            key: node.cloudantConfig.username,
             password: node.cloudantConfig.password,
             url: node.cloudantConfig.url
         };
 
         Cloudant(credentials, function(err, cloudant) {
-            if (err) { node.error(err.description, err); }
+            if (err) {
+                node.error(err.description, err);
+            }
 
             node.on("input", function(msg) {
                 if (err) {
                     return node.error(err.description, err);
                 }
-
+                if (isTemplatedDatabase) {
+                    database = mustache.render(database, msg);
+                }
+                this.database = _cleanDatabaseName(database, this);
                 var db = cloudant.use(node.database);
-                var options = (typeof msg.payload === "object") ? msg.payload : {};
+                var options =
+                    typeof msg.payload === "object" ? msg.payload : {};
 
                 if (node.search === "_id_") {
                     var id = getDocumentId(msg.payload);
@@ -261,17 +306,21 @@ module.exports = function(RED) {
                     db.get(id, function(err, body) {
                         sendDocumentOnPayload(err, body, msg);
                     });
-                }
-                else if (node.search === "_idx_") {
-                    options.query = options.query || options.q || formatSearchQuery(msg.payload);
+                } else if (node.search === "_idx_") {
+                    options.query =
+                        options.query ||
+                        options.q ||
+                        formatSearchQuery(msg.payload);
                     options.include_docs = options.include_docs || true;
                     options.limit = options.limit || 200;
 
-                    db.search(node.design, node.index, options, function(err, body) {
+                    db.search(node.design, node.index, options, function(
+                        err,
+                        body
+                    ) {
                         sendDocumentOnPayload(err, body, msg);
                     });
-                }
-                else if (node.search === "_all_") {
+                } else if (node.search === "_all_") {
                     options.include_docs = options.include_docs || true;
 
                     db.list(options, function(err, body) {
@@ -294,7 +343,9 @@ module.exports = function(RED) {
         function formatSearchQuery(query) {
             if (typeof query === "object") {
                 // useful when passing the query on HTTP params
-                if ("q" in query) { return query.q; }
+                if ("q" in query) {
+                    return query.q;
+                }
 
                 var queryString = "";
                 for (var key in query) {
@@ -311,26 +362,28 @@ module.exports = function(RED) {
                 msg.cloudant = body;
 
                 if ("rows" in body) {
-                    msg.payload = body.rows.
-                        map(function(el) {
+                    msg.payload = body.rows
+                        .map(function(el) {
                             if (el.doc._id.indexOf("_design/") < 0) {
                                 return el.doc;
                             }
-                        }).
-                        filter(function(el) {
+                        })
+                        .filter(function(el) {
                             return el !== null && el !== undefined;
                         });
                 } else {
                     msg.payload = body;
                 }
-            }
-            else {
+            } else {
                 msg.payload = null;
 
                 if (err.description === "missing") {
                     node.warn(
-                        "Document '" + node.inputId +
-                        "' not found in database '" + node.database + "'.",
+                        "Document '" +
+                            node.inputId +
+                            "' not found in database '" +
+                            node.database +
+                            "'.",
                         err
                     );
                 } else {
@@ -348,16 +401,15 @@ module.exports = function(RED) {
     function _getCloudantConfig(n) {
         if (n.service === "_ext_") {
             return RED.nodes.getNode(n.cloudant);
-
         } else if (n.service !== "") {
-            var service        = appEnv.getService(n.service);
-            var cloudantConfig = { };
+            var service = appEnv.getService(n.service);
+            var cloudantConfig = {};
 
             var host = service.credentials.host;
 
             cloudantConfig.username = service.credentials.username;
             cloudantConfig.password = service.credentials.password;
-            cloudantConfig.account  = host.substring(0, host.indexOf('.'));
+            cloudantConfig.account = host.substring(0, host.indexOf("."));
 
             return cloudantConfig;
         }
@@ -371,9 +423,9 @@ module.exports = function(RED) {
         // caps are not allowed
         newDatabase = newDatabase.toLowerCase();
         // remove trailing underscore
-        newDatabase = newDatabase.replace(/^_/, '');
+        newDatabase = newDatabase.replace(/^_/, "");
         // remove spaces and slashed
-        newDatabase = newDatabase.replace(/[\s\\/]+/g, '-');
+        newDatabase = newDatabase.replace(/[\s\\/]+/g, "-");
 
         if (newDatabase !== database) {
             node.warn("Database renamed  as '" + newDatabase + "'.");
